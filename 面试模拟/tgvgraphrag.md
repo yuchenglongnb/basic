@@ -502,9 +502,455 @@ TOTAL_QUERIES = 500       # 总查询数
 
 ---
 
-## 9. GraphRAG 索引阶段设计
+## 9. 基于 GraphRAG 的二次开发
 
-### 9.1 索引阶段总体流程
+本项目基于微软开源 GraphRAG 框架进行深度二次开发，针对 TGV 工业场景的特点，在 schema 设计、知识抽取、检索链路、性能优化等方面进行了系统性改造。
+
+### 9.1 Schema 定制：从通用实体到工业实体
+
+#### 9.1.1 实体类型扩展
+
+原生 GraphRAG 使用通用实体类型（ORGANIZATION, PERSON, GEO, EVENT），项目将其扩展为工业领域 schema：
+
+```python
+# 核心实体类型定义
+ENTITY_TYPES = {
+    # 产品层级
+    "PRODUCTLOT": "制造批次",
+    "BOARD": "基板/板级对象", 
+    "HOLE": "孔位对象",
+    
+    # 工艺层级
+    "PROCESSSTEP": "工艺步骤（激光诱导、湿法刻蚀等）",
+    "TOOL": "设备/机台",
+    "RECIPE": "工艺配方",
+    "PROCESSPARAMETER": "工艺参数（带单位）",
+    "MATERIAL": "材料/试剂",
+    
+    # 缺陷层级
+    "DEFECTTYPE": "缺陷类型",
+    "DEFECTCAUSE": "缺陷原因",
+    "ACTIONMEASURE": "措施建议",
+    
+    # 支撑层级
+    "ENVIRONMENTFACTOR": "环境因素",
+    "IMAGEASSET": "图像元数据",
+    "DOCUMENT": "源文档",
+    "EXPERTRULE": "专家规则"
+}
+```
+
+#### 9.1.2 关系类型定义
+
+定义了 25+ 种工业关系类型，覆盖完整工艺追因链：
+
+```python
+# 层级关系
+RELATIONSHIPS = [
+    "LOT_HAS_BOARD",           # 批次包含板
+    "BOARD_HAS_HOLE",          # 板包含孔
+    "BOARD_USES_RECIPE",       # 板使用配方
+    
+    # 工艺关系
+    "STEP_USES_TOOL",          # 工序使用设备
+    "STEP_USES_MATERIAL",      # 工序使用材料
+    "STEP_HAS_PARAMETER",      # 工序关联参数
+    
+    # 事件关系
+    "EVENT_OCCURS_AT_STEP",    # 事件发生于工序
+    "EVENT_ON_BOARD",          # 事件发生于板
+    "EVENT_ON_HOLE",           # 事件发生于孔
+    
+    # 缺陷关系（核心）
+    "DETECTS_DEFECT",          # 检测到缺陷
+    "DEFECT_HAS_CAUSE",        # 缺陷有原因
+    "CAUSE_HAS_MEASURE",       # 原因有措施
+    "DEFECT_RELATED_TO_PARAMETER",  # 缺陷关联参数
+    "DEFECT_RELATED_TO_STEP",  # 缺陷关联工序
+    "CAUSE_RELATED_TO_TOOL",   # 原因关联设备
+    
+    # 证据关系
+    "RULE_SUPPORTS_CAUSE",     # 规则支持原因
+    "DOCUMENT_SUPPORTS_RELATION",  # 文档支持关系
+    "INFERENCE_REFERENCES_ENTITY"  # 推理引用实体
+]
+```
+
+#### 9.1.3 四元组知识表示
+
+针对工业知识的特点，引入四元组表示（主体-关系-客体-条件）：
+
+```
+三元组: 高激光功率密度 → CAUSES → 孔壁重铸层增厚
+条件:   [基板类型=薄玻璃, 功率密度>500W/cm², 扫描速度<200mm/s]
+证据:   《工艺分析报告-2024-Q2》第15页
+```
+
+这种表示方式可以：
+- 保留参数阈值和适用范围
+- 减少错误泛化
+- 支持条件化检索
+
+### 9.2 Prompt 工程：保守抽取与证据绑定
+
+#### 9.2.1 抽取 Prompt 改造
+
+基于 `prompts-tgv/extract_graph.txt`，改造核心原则：
+
+1. **保守抽取原则**：只抽取原文明确支持的实体和关系
+2. **条件保留**：关系必须包含适用条件（参数范围、材料类型）
+3. **证据绑定**：每个关系必须标注来源文档和段落
+4. **术语标准化**：使用统一工业术语（如"激光诱导"而非"激光打孔"）
+
+**关键 Prompt 片段**：
+
+```text
+-Goal-
+Given a text document potentially relevant to TGV manufacturing, identify 
+all entities of the specified industrial types and all causal relationships.
+
+Extraction Principles:
+1. Conservative Extraction: Only extract entities explicitly supported by text
+2. Condition Preservation: Include parameter ranges and material types
+3. Evidence Binding: Always indicate source of information
+4. Terminology Standardization: Use standardized industrial terms
+5. Parameter Units: Always include units (W/cm², μm, seconds)
+6. Defect-Cause-Measure Chain: Prioritize extracting complete causal chains
+```
+
+#### 9.2.2 查询 Prompt 改造
+
+针对不同搜索模式定制 prompt：
+
+| 搜索模式 | Prompt 文件 | 定制重点 |
+|---------|------------|---------|
+| Local Search | `local_search_system_prompt.txt` | 三段式输出：结论→依据→建议 |
+| Global Search | `global_search_map_system_prompt.txt` | 跨社区模式识别 |
+| Drift Search | `drift_search_system_prompt.txt` | 探索性分析，假设生成 |
+| Basic Search | `basic_search_system_prompt.txt` | 简洁事实回答 |
+
+### 9.3 Query NER 联合解码机制
+
+针对工艺评估查询中长文本实体易遗漏的问题，设计了轻量级实体抽取链路。
+
+#### 9.3.1 架构设计
+
+```
+用户查询 → Query NER (启发式) → Fuzzy Linking → 实体锚点
+                ↓                      ↓
+          < 1ms 延迟           ~8ms 延迟
+                ↓                      ↓
+         抽取候选实体          对齐知识库标准名
+                              ↓
+                        与语义检索融合
+                              ↓
+                         指导子图召回
+```
+
+#### 9.3.2 核心实现
+
+```python
+# 文件: .venv/lib/python3.12/site-packages/graphrag/query/context_builder/query_entity_extractor.py
+
+class QueryEntityExtractor:
+    """查询实体抽取器 - 启发式规则 + 模糊匹配"""
+    
+    def extract(self, query: str) -> list[str]:
+        """启发式：大写单词和引号文本"""
+        pattern = r'\b[A-Z][A-Z\s]{1,50}\b'
+        matches = re.findall(pattern, query.upper())
+        return list(set(m.strip() for m in matches if len(m.strip()) > 2))
+
+def get_entity_by_name_fuzzy(entities_dict, name, fuzzy_threshold=0.8):
+    """Fuzzy Linking - 将抽取的别名对齐到标准实体"""
+    candidates = [e.title for e in entities_dict.values()]
+    return difflib.get_close_matches(name, candidates, n=3, cutoff=fuzzy_threshold)
+```
+
+#### 9.3.3 性能指标
+
+| 指标 | 数值 |
+|-----|------|
+| NER 抽取延迟 | < 1ms |
+| 模糊匹配延迟 | ~8ms |
+| 实体链接准确率 | > 95% |
+
+### 9.4 子图挖掘算法
+
+#### 9.4.1 2-3 Hop DFS 因果链提取
+
+```python
+# 文件: .venv/lib/python3.12/site-packages/graphrag/query/input/retrieval/subgraph_mining.py
+
+def extract_causal_chains(seed_entities, relationships, max_hops=2, top_k_paths=10):
+    """
+    基于 DFS 的多跳因果链提取
+    
+    Args:
+        seed_entities: 种子实体列表（从 Query NER 获得）
+        relationships: 全量关系列表
+        max_hops: 最大跳数（2-3 hop）
+        top_k_paths: 返回 Top-K 路径
+    """
+    # 构建邻接表（无向图）
+    adj = defaultdict(list)
+    for rel in relationships:
+        adj[rel.source].append(rel)
+        adj[rel.target].append(rel)
+    
+    paths = []
+    def dfs(current, path, depth):
+        if depth >= max_hops:
+            if len(path) > 0:
+                paths.append(path[:])
+            return
+        for rel in adj.get(current, []):
+            next_node = rel.target if rel.source == current else rel.source
+            if rel not in path:  # 避免环路
+                path.append(rel)
+                dfs(next_node, path, depth + 1)
+                path.pop()
+    
+    # 从每个种子实体出发搜索
+    for seed in seed_entities:
+        dfs(seed.title, [], 0)
+    
+    # 按权重排序，返回 Top-K
+    paths.sort(key=lambda p: sum(r.weight or 0 for r in p), reverse=True)
+    return paths[:top_k_paths]
+```
+
+#### 9.4.2 路径排序策略
+
+```python
+def rank_paths(paths, strategy="weighted"):
+    """多策略路径排序"""
+    if strategy == "weighted":
+        # 按关系权重和排序
+        return sorted(paths, key=lambda p: sum(r.weight for r in p), reverse=True)
+    elif strategy == "causal_strength":
+        # 按因果强度（关系类型）排序
+        priority = {"CAUSES": 10, "HAS_CAUSE": 9, "RELATED_TO": 5}
+        return sorted(paths, key=lambda p: sum(priority.get(r.type, 1) for r in p), reverse=True)
+    elif strategy == "recency":
+        # 按时序（最新证据优先）
+        return sorted(paths, key=lambda p: max(r.timestamp for r in p), reverse=True)
+```
+
+### 9.5 GraphNarrator 叙事化
+
+将结构化子图转换为自然语言上下文，降低大模型理解成本。
+
+#### 9.5.1 核心实现
+
+```python
+# 文件: .venv/lib/python3.12/site-packages/graphrag/query/context_builder/graph_narrator.py
+
+class GraphNarrator:
+    """图谱叙事化 - 结构化数据转自然语言"""
+    
+    def narrate_subgraph(self, entities, relationships):
+        """生成 markdown 格式的知识叙述"""
+        lines = ["## Relevant Knowledge\n", "### Key Entities"]
+        
+        # 实体描述
+        for e in entities:
+            desc = e.description[:200] + "..." if len(e.description) > 200 else e.description
+            lines.append(f"- **{e.title}** ({e.type}): {desc}")
+        
+        # 关系描述
+        lines.append("\n### Relationships and Connections")
+        for rel in relationships:
+            desc = rel.description[:100] if len(rel.description) > 100 else rel.description
+            lines.append(f"- {rel.source} is related to {rel.target}: {desc}")
+        
+        return "\n".join(lines)
+    
+    def narrate_causal_chain(self, path):
+        """叙事化因果链"""
+        chain = [path[0].source]
+        for rel in path:
+            chain.append(rel.target)
+        return " → ".join(chain)
+```
+
+#### 9.5.2 模板系统
+
+针对不同实体类型使用专用模板：
+
+```python
+TEMPLATES = {
+    "DEFECTTYPE": "{name}是一种{level}级别缺陷，表现为{manifestation}，"
+                  "通常由{cause}引起，可通过{measure}预防。",
+    
+    "PROCESSPARAMETER": "{name}是关键工艺参数，单位{unit}，"
+                       "典型范围{range}，影响{affected_defects}。",
+    
+    "DEFECTCAUSE": "{name}的触发条件包括{conditions}，"
+                   "常见于{process_step}工序。"
+}
+```
+
+### 9.6 HybridSearch 混合检索引擎
+
+#### 9.6.1 架构设计
+
+```
+Query → Query NER → 实体链接 → 语义检索(BGE-M3)
+                ↓                ↓
+         精确匹配锚点      相似度召回
+                └────────┬────────┘
+                         ↓
+              ┌──────────┴──────────┐
+              ↓                     ↓
+        Global Search          Local Search
+        (宏观主题定位)          (精细子图检索)
+        - 社区摘要              - 2-3 hop子图
+        - 趋势分析              - 因果链
+              └──────────┬──────────┘
+                         ↓
+                    上下文融合
+                    (优先级排序)
+                         ↓
+                    截断与压缩
+                         ↓
+                    大模型生成
+```
+
+#### 9.6.2 融合策略
+
+```python
+class HybridSearch:
+    """混合检索 - Global + Local 融合"""
+    
+    def search(self, query):
+        # 1. Query NER 获取锚点
+        entities = self.query_ner.extract(query)
+        
+        # 2. 并行执行 Global 和 Local
+        with ThreadPoolExecutor() as executor:
+            global_future = executor.submit(self.global_search, query)
+            local_future = executor.submit(self.local_search, entities)
+            global_results = global_future.result()
+            local_results = local_future.result()
+        
+        # 3. 融合排序（NER 精确匹配优先级更高）
+        fused = self.fuse_results(global_results, local_results, entities)
+        
+        # 4. 上下文截断
+        context = self.truncate(fused, max_tokens=12000)
+        
+        return context
+    
+    def fuse_results(self, global_res, local_res, query_entities):
+        """结果融合 - 精确匹配优先"""
+        results = []
+        
+        # Local 结果（精确匹配）赋予高权重
+        for item in local_res:
+            if item.entity in query_entities:
+                item.priority = 10  # 精确匹配
+            else:
+                item.priority = 7   # 子图扩展
+            results.append(item)
+        
+        # Global 结果（语义相关）赋予中等权重
+        for item in global_res:
+            item.priority = 5
+            results.append(item)
+        
+        # 按优先级排序
+        return sorted(results, key=lambda x: x.priority, reverse=True)
+```
+
+### 9.7 性能优化
+
+#### 9.7.1 vLLM 推理引擎优化
+
+**关键配置** (`vllm_spec_7b_draft.sh`)：
+
+```bash
+#!/bin/bash
+# 投机解码配置：7B draft + 14B target
+
+DRAFT_MODEL_PATH="/mnt/data2/ycl/graphrag/Qwen2.5-Coder-7B-Instruct"
+
+# 投机解码配置
+SPECULATIVE_CONFIG_JSON=$(printf '{
+    "method": "draft_model",
+    "model": "%s",
+    "num_speculative_tokens": 5,
+    "draft_tensor_parallel_size": 1
+}' "$DRAFT_MODEL_PATH")
+
+# 启动参数
+CUDA_VISIBLE_DEVICES=7 \
+MODEL_PATH="/mnt/data2/ycl/graphrag/Qwen2.5-Coder-14B-Instruct" \
+TENSOR_PARALLEL_SIZE=1 \
+MAX_MODEL_LEN=8192 \
+MAX_NUM_SEQS=4 \
+GPU_MEMORY_UTILIZATION=0.95 \
+SPECULATIVE_CONFIG_JSON="$SPECULATIVE_CONFIG_JSON" \
+bash "$SCRIPT_DIR/vllm.sh"
+```
+
+**性能提升**：
+
+| 指标 | Ollama | vLLM | 提升 |
+|-----|--------|------|------|
+| 平均吞吐 | 300.6 tok/s | 416.6 tok/s | +38.6% |
+| 长时稳定性 | 10min 超时 | 稳定运行 | 显著改善 |
+| 显存碎片 | 严重 | PagedAttention 管理 | 改善 |
+
+#### 9.7.2 缓存策略
+
+```python
+# GraphRAG 索引阶段缓存配置
+CACHE_CONFIG = {
+    "type": "file",
+    "base_dir": "cache",
+    
+    # 缓存粒度
+    "entity_cache": True,      # 实体抽取结果
+    "relation_cache": True,    # 关系抽取结果
+    "embedding_cache": True,   # 向量 embedding
+    "community_cache": True,   # 社区发现结果
+    
+    # 缓存策略
+    "ttl_hours": 24,           # 缓存有效期
+    "max_size_gb": 10          # 最大缓存大小
+}
+```
+
+#### 9.7.3 并发控制
+
+```yaml
+# settings.vllm.yaml 并发配置
+llm:
+  concurrent_requests: 4      # LLM 并发请求数
+  max_retries: 3              # 最大重试次数
+  retry_strategy: exponential_backoff
+
+parallelization:
+  stagger: 0.3               # 请求间隔（秒）
+  num_threads: 50            # 线程池大小
+```
+
+### 9.8 关键代码文件位置
+
+| 组件 | 文件路径 | 说明 |
+|-----|---------|------|
+| Query NER | `.venv/lib/python3.12/site-packages/graphrag/query/context_builder/query_entity_extractor.py` | 实体抽取与链接 |
+| 子图挖掘 | `.venv/lib/python3.12/site-packages/graphrag/query/input/retrieval/subgraph_mining.py` | DFS 因果链提取 |
+| GraphNarrator | `.venv/lib/python3.12/site-packages/graphrag/query/context_builder/graph_narrator.py` | 叙事化生成 |
+| HybridSearch | `.venv/lib/python3.12/site-packages/graphrag/query/input/retrieval/hybrid_search.py` | 混合检索引擎 |
+| 工业 Prompts | `prompts-tgv/*.txt` | 定制化 prompt 模板 |
+
+---
+
+## 10. GraphRAG 索引阶段设计
+
+### 10.1 索引阶段总体流程
 
 1. 导入原始文档和业务数据
 2. 按文档块进行切分 (size=512, overlap=50)
@@ -514,7 +960,7 @@ TOTAL_QUERIES = 500       # 总查询数
 6. 用 embedding 模型生成向量索引
 7. 产出用于查询阶段的图谱和社区摘要材料
 
-### 9.2 抽取阶段的二次开发点
+### 10.2 抽取阶段的二次开发点
 
 与原生 GraphRAG 相比，项目主要做了以下定制：
 
@@ -524,7 +970,7 @@ TOTAL_QUERIES = 500       # 总查询数
 - 对缺陷原因、措施、参数、工序进行重点建模，服务后续追因和建议场景
 - 对别名、缩写和同义词做归一化处理，减少图谱脏节点
 
-### 9.3 为什么要保守抽取
+### 10.3 为什么要保守抽取
 
 工业场景最怕的不是漏一条知识，而是抽出一条表面合理但实际上错误的因果关系。因此抽取阶段的原则是：
 
@@ -535,9 +981,9 @@ TOTAL_QUERIES = 500       # 总查询数
 
 ---
 
-## 10. 查询阶段设计
+## 11. 查询阶段设计
 
-### 10.1 问题理解
+### 11.1 问题理解
 
 输入通常是自然语言，比如：
 
@@ -552,7 +998,7 @@ TOTAL_QUERIES = 500       # 总查询数
 - 相似案例查询
 - 工艺优化建议
 
-### 10.2 关键实体抽取
+### 11.2 关键实体抽取
 
 在项目方案里，这一步由 **Query NER + Fuzzy Linking** 完成，重点识别：
 
@@ -563,7 +1009,7 @@ TOTAL_QUERIES = 500       # 总查询数
 - 批次/板号/孔号
 - 时间范围
 
-### 10.3 子图召回与证据扩展
+### 11.3 子图召回与证据扩展
 
 系统围绕关键实体做多种召回：
 
@@ -572,7 +1018,7 @@ TOTAL_QUERIES = 500       # 总查询数
 - 相似案例召回 (向量检索)
 - 参数和规则召回 (结构化查询)
 
-### 10.4 Local / Global / Drift / Basic 的场景分工
+### 11.4 Local / Global / Drift / Basic 的场景分工
 
 | 搜索模式 | 适用场景 | 示例 |
 |---------|---------|------|
@@ -583,7 +1029,7 @@ TOTAL_QUERIES = 500       # 总查询数
 
 ---
 
-## 11. 图像与多模态边界
+## 12. 图像与多模态边界
 
 这个项目容易被误解成"GraphRAG 直接看图并推理"。更准确的边界是：
 
@@ -598,9 +1044,9 @@ TOTAL_QUERIES = 500       # 总查询数
 
 ---
 
-## 12. 部署建议
+## 13. 部署建议
 
-### 12.1 一期部署目标
+### 13.1 一期部署目标
 
 建议先做"离线建图 + 在线查询"的模式：
 
@@ -609,7 +1055,7 @@ TOTAL_QUERIES = 500       # 总查询数
 - 不直接做在线自动调参
 - 输出以辅助决策为主，保留人工审核
 
-### 12.2 基础组件
+### 13.2 基础组件
 
 - vLLM 推理服务 (生成模型)
 - Ollama 嵌入服务 (Embedding 模型)
@@ -619,7 +1065,7 @@ TOTAL_QUERIES = 500       # 总查询数
 - 对象存储 (文档、图像)
 - 日志与监控系统
 
-### 12.3 硬件配置建议
+### 13.3 硬件配置建议
 
 | 组件 | 配置 | 说明 |
 |-----|------|------|
@@ -630,7 +1076,7 @@ TOTAL_QUERIES = 500       # 总查询数
 
 ---
 
-## 13. 关键脚本与文档
+## 14. 关键脚本与文档
 
 | 文件 | 说明 |
 |-----|------|
@@ -645,6 +1091,6 @@ TOTAL_QUERIES = 500       # 总查询数
 
 ---
 
-## 14. 面试或汇报时可概括成的一句话
+## 15. 面试或汇报时可概括成的一句话
 
 这个项目本质上是一个面向 TGV 制造场景的因果知识增强工艺评估系统：通过 GraphRAG 把工艺文档、日志、检测结果、专家经验和缺陷知识组织成可检索、可追溯、可解释的图谱，再结合大模型完成缺陷追因、工艺评估和优化建议生成；在工程实现上，完成了从 Ollama 到 vLLM 的推理引擎优化（吞吐提升 38.6%），设计了 Query NER + 子图挖掘 + GraphNarrator 的检索增强链路（上下文扩充 847%），并构建了完整的评测体系验证生成质量和检索性能。
