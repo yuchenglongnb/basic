@@ -1,20 +1,21 @@
 # 医疗大模型项目面试八股文
-> 基于 HealthAI-2025 + MedicalGPT，涵盖数据构造 / 训练 / 评测全链路
+> 基于 MedicalGPT 的医疗大模型训练与评测闭环，涵盖数据构造 / 训练 / 对齐 / 评测全链路
 
 ---
 
 ## 一、项目整体定位（开场白）
 
-> **"本项目以 HealthAI-2025 天池竞赛的临床病例数据为基础，结合 MedicalGPT 框架，搭建了一套完整的医疗大模型训练与评测闭环：用向量召回驱动数据构造、走完 SFT → Reward Model → PPO 的完整 RLHF 链路，并用 CEval 医疗指标 + PPL 双维度量化模型的真实提升。核心价值不在于跑通了一个框架，而在于数据、训练、评测三块互相咬合，形成可复现的改进闭环。"**
+> **"本项目基于 MedicalGPT 框架，对 Qwen2.5-0.5B 做医疗领域训练与评测闭环：先做 SFT，再做 Reward Model 和 DPO，并补了一条 PPO 最小闭环；数据侧的核心亮点不是随机抽医疗数据，而是以 CEval 医疗验证集为锚点做分布对齐召回。核心价值不在于跑通单个脚本，而在于把数据、训练、评测三块真正咬合起来，并能解释为什么有的方法改善主观生成质量，有的方法带来 benchmark 收益。"**
 
 | 维度 | 内容 |
 |---|---|
-| 竞赛/数据来源 | HealthAI-2025 天池健康智能挑战赛（临床病例数据） |
-| 训练框架 | shibing624/MedicalGPT（⭐4.6k） |
-| 评测框架 | EleutherAI/lm-evaluation-harness |
-| Base Model | Llama3.2-3B / Qwen2.5-3B |
-| 训练阶段 | SFT → Reward Modeling → PPO（RLHF） |
-| 核心改进 | 向量召回数据筛选 + 偏好数据合成 + CEval 医学指标提升 |
+| 主要数据来源 | `shibing624/medical` + MedicalGPT 仓库内 SFT/RM 小样本数据 |
+| 项目背景数据 | HealthAI-2025 可作为后续结构化病例扩展来源 |
+| 训练框架 | `shibing624/MedicalGPT` |
+| 评测框架 | `lm-evaluation-harness` |
+| 当前主 Base Model | `Qwen/Qwen2.5-0.5B-Instruct` |
+| 已完成训练阶段 | SFT → Reward Modeling → DPO → PPO 最小闭环 |
+| 当前最强结果 | 数据分布对齐后，`clinical_medicine` 从 `0.4545` 提升到 `0.5000`（`+4.55pp`） |
 
 ---
 
@@ -30,9 +31,9 @@
 - 基于病人病情和病历特征，可用大模型合成推理链数据（Chain-of-Thought）
 
 **② `shibing624/medical` 开源医疗数据集（240万条）**
-- 预训练语料（PT）：大规模医学文本，用于增量预训练
-- 指令微调数据（SFT）：11万条中英文医疗问诊对话
-- 奖励模型数据（RM）：4000条偏好对，chosen = 医生答复，rejected = 本草模型答复
+- 预训练语料（PT）：医学百科、教材切片等，用于增量预训练
+- 指令微调数据（SFT）：其中中文 `train_zh_0` 约 195 万条，英文 `train_en_1` 约 11 万条
+- 奖励模型数据（RM）：`train.json` 约 3800 条偏好对；你当前项目里真实跑通的是仓库内 `data/reward/dpo_zh_500.jsonl` 这类小规模偏好子集
 
 ---
 
@@ -145,7 +146,7 @@ n4k 医疗偏好数据
 
 **Q：用什么 Embedding 模型？为什么？**
 
-> A：优选 `BAAI/bge-large-zh-v1.5` 或 `text2vec-large-chinese`，两者在中文语义检索 MTEB 榜单上表现最优，且对医疗术语的语义理解优于通用 OpenAI Embedding。向量维度 1024，支持批量推理，效率可接受。
+> A：工程方案上我会优先考虑 `BAAI/bge-large-zh-v1.5` 这类更强的中文 embedding；但当前这轮真实实验里，我实际跑通并拿到结果的是 `BAAI/bge-small-zh-v1.5`，因为它在 `1k/5k/50k` 子集验证阶段吞吐更友好。原理上，embedding 模型最重要的是能稳定表示中文医疗问答、症状、疾病和处理建议之间的语义近邻关系，而不是参数越大越好；所以第一轮我优先选了一个更容易快速验证方法有效性的版本。
 
 ---
 
@@ -313,6 +314,95 @@ target_kl = 6.0         # 自适应 KL 目标值
 
 ---
 
+### 3.5A 当前仓库里的 PPO 最小闭环怎么落地
+
+按当前仓库与环境，更稳妥的 PPO 最小闭环不是直接上全量 RLHF，而是先补一条可验证链路：
+- `policy`：使用 `./outputs-local-sft-smoke-merged`
+- `reward model`：使用 `./outputs-local-rm-qwen-v1-merged`
+- `value/critic`：先用和 RM 相同的 merged checkpoint 做初始化，但训练职责与 reward model 不同
+- `ref policy`：默认使用同一个 SFT merged 起点做 KL 约束
+- `prompt 数据`：优先使用已经做过分布对齐筛选的 `./data/finetune_ablation/retrieved_t70`
+
+代码与脚本层面已经补了：
+- `ppo_training.py`：兼容当前 `trl==0.29.0`，支持 `trl.experimental.ppo` 回退
+- `commands/merge_local_rm_48g.sh`
+- `commands/local_ppo_48g.sh`
+- `commands/local_ceval_ppo_compare.sh`
+
+推荐先用下面这组保守配置验证链路：
+- `response_length=256`
+- `per_device_train_batch_size=1`
+- `gradient_accumulation_steps=4`
+- `total_episodes=1000`
+- `num_sample_generations=4`
+- `local_rollout_forward_batch_size=4`
+- `learning_rate=1e-6`
+- `kl_coef=0.05`
+- `cliprange=0.2`
+- `vf_coef=0.1`
+
+你在面试里可以这样讲：
+> 当前 PPO 我把它定位成“最小闭环增强路线”。它的目标不是立刻比 DPO 更强，而是验证 `SFT -> RM -> PPO -> CEval` 这条 RLHF 主线在现有环境里能否完整落地。数据上我会直接复用已经验证过有效的分布对齐 prompt 池，先用统一 CEval 和 10 条医疗样例对比 PPO、DPO 和 SFT 的差异。
+
+### 3.5B RM 和 DPO 是否可以用同一份偏好数据
+
+可以。像当前仓库里的 `data/reward/dpo_zh_500.jsonl`，同时包含：
+- `question`
+- `response_chosen`
+- `response_rejected`
+
+这份偏好对数据既可以训练 RM，也可以训练 DPO。关键差异不在数据，而在训练目标：
+- **RM**：学习 `score(chosen) > score(rejected)`，输出的是单个回答的标量分数，本质是打分器 / 判别器
+- **DPO**：直接优化语言模型，让策略相对 reference 更偏向 `chosen`、远离 `rejected`，输出的是新的生成模型
+
+所以面试里最稳的说法是：
+> RM 和 DPO 可以共享同一份偏好对数据，但它们学的不是同一件事。RM 学的是“哪个回答更好”，DPO 学的是“让模型更偏向好回答”。RM 更像 reward source，DPO 更像直接的 policy optimization。
+
+### 3.5C 为什么 DPO/PPO 不一定提升 CEval，但仍然有价值
+
+这部分是很容易被面试官追问的，八股上要讲清楚三件事：
+
+1. **训练目标不同。**
+- SFT 优化的是 token-level likelihood，本质是“学会怎么回答”；
+- DPO 优化的是偏好分布，本质是“让模型更偏向 chosen 风格的回答”；
+- PPO 优化的是 reward，本质是“让模型更倾向于得到高 reward 的回答”。
+
+2. **评测目标不同。**
+- CEval 更像医学知识选择题 / 判断题 benchmark；
+- 小样本开放问答评测更关注结构完整性、重复崩坏、安全兜底等生成质量；
+- 所以“回答更顺、更完整”不等于“知识型 benchmark 一定更高”。
+
+3. **你当前实验正好验证了这个现象。**
+- DPO 在主观样例里缓解了重复崩坏、结构更完整；
+- 但统一 CEval 下，`basic_medicine` 从 `0.5789` 降到 `0.4737`，`clinical_medicine` 持平 `0.5000`；
+- PPO 最小闭环完整跑通后，统一 CEval 与 SFT 持平（`0.5789 / 0.5000`），而且样例里还暴露出中英混杂、`<|endoftext|>`、`Human:`/`Assistant:` 串入等边界污染问题。
+
+> 面试里的正确口径不是“DPO/PPO 没用”，而是：偏好对齐解决的是生成偏好和行为约束问题，不天然等价于医学知识 benchmark 提升；因此必须把标准化评测和开放问答评测结合起来看。
+
+### 3.5D 模型尺寸和数据量怎么一起看
+
+这也是你当前项目非常适合展开的一段原理：
+- 你自己的 `0.5B + 随机 500 条` 没有带来 CEval 提升；
+- 朋友的 `3B + 随机 9000 条` 反而更差。
+
+这个现象说明，**决定微调成败的核心不是“模型更大”或“数据更多”本身，而是模型容量、数据质量、数据分布、训练目标和评测目标是否匹配。**
+
+常见原因：
+1. 数据分布与评测目标不一致，模型学到的是问诊风格而不是考试型知识判断。
+2. 数据质量不均，噪声被放大，模型越能学反而越可能把偏差学进去。
+3. 模型变大后，同一套学习率、batch size、训练步数未必仍在稳定区间。
+4. 长时间单领域微调容易引起灾难性遗忘或能力挤压。
+
+可以直接记下面这张关系表：
+
+| 模型规模 | 对数据量的耐受度 | 对数据质量的敏感度 | 更适合的策略 |
+|---|---|---|---|
+| `0.5B` | 低到中 | 很高 | 少量高质量、强筛选、强分布对齐 |
+| `3B` | 中 | 高 | 中等规模数据，先筛选再扩量 |
+| `7B+` | 中到高 | 仍然高 | 可以扩更多数据，但仍要严格控分布和噪声 |
+
+> 这也是为什么你当前项目最强的故事线不是“我上了更大的模型或更多的数据”，而是“我用数据分布对齐把有限参数优先用在更贴近目标任务的样本上”。
+
 ### 3.6 可选：DPO（直接偏好优化）
 
 DPO 是 RLHF 的简化替代方案：**去掉显式的 Reward Model 和 RL 训练，直接在偏好对上优化语言模型**。
@@ -332,11 +422,35 @@ $$\mathcal{L}_{DPO} = -\mathbb{E}\left[\log \sigma\left(\beta \log \frac{\pi_\th
 
 ### 3.7 可选：GRPO（Group Relative Policy Optimization）
 
-MedicalGPT v2.4 新增，纯 RL 方法，类似 DeepSeek-R1 的训练思路：
-- 无需 Critic 模型（省去一半显存）
-- 用组内相对奖励替代绝对价值估计
-- 可体验「aha moment」——模型自发产生推理链
+GRPO 可以理解成一条“比 PPO 更轻、但仍然是 reward 驱动策略优化”的路线。它保留 RL 式采样优化的优点，但不再维护完整的 Critic 价值网络，工程成本通常低于 PPO。
+
+当前仓库里的实现入口是：
 - 脚本：`grpo_training.py` / `run_grpo.sh`
+- 当前样例数据：`data/grpo/sample.jsonl`
+- 当前默认 reward：`accuracy_reward + format_reward`
+
+但这里有一个面试时必须讲清楚的现实差异：
+- **DPO** 当前已经是医疗主线可直接落地的对齐方法，因为它吃的是 `question + chosen + rejected` 偏好对。
+- **GRPO** 这版代码更像“可验证答案任务”的模板实现，输入格式是 `question + answer`，reward 也偏向 exact match / 格式检查，不适合直接原样用于医疗开放问答。
+
+所以在医疗项目里，GRPO 更合理的定位是：
+- **可以复用 DPO 的“分布对齐筛题”思路**：还是先用 CEval 医疗子任务做锚点，筛出更贴近目标分布的问题。
+- **不能直接复用 DPO 的偏好对格式**：GRPO 需要的是 `question + reward context/reference answer`，而不是 `chosen/rejected` 原样输入。
+- **reward 必须医疗化改造**：当前最合理的路线不是继续用 exact match，而是改成 `RM 分数 + 格式奖励 + 安全奖励` 的组合，或者至少先做 `规则版 reward` 的 smoke test。
+
+建议你在面试里这样讲 GRPO：
+> GRPO 这条线我把它定位成 DPO 之后的增强路线。它和 DPO 一样，都可以复用前面的分布对齐筛题思路，但训练信号不一样：DPO 直接利用偏好对，GRPO 则更依赖 reward 设计。对医疗开放问答来说，当前仓库默认的 GRPO reward 偏向数学题模板，所以如果真要落地，我会先把 RM 接成 learned reward，再补格式和安全 reward，最后用统一 CEval 和开放问答样例去比较 DPO 和 GRPO。
+
+可以直接用下面这张表回答“DPO 和 GRPO 怎么选”：
+
+| 对比维度 | DPO | GRPO |
+|---|---|---|
+| 训练信号 | `chosen/rejected` 偏好对 | 生成采样 + reward |
+| 当前仓库的医疗适配度 | 高 | 低，需改 reward |
+| 数据构造是否能复用筛题逻辑 | 可以 | 可以 |
+| 是否能直接用当前 `dpo_zh_500` | 可以 | 不建议直接原样用 |
+| 工程复杂度 | 较低 | 较高 |
+| 当前项目定位 | 主线 | 后续增强路线 |
 
 ---
 
@@ -387,13 +501,18 @@ lm_eval --model hf \
 
 ### 4.2 核心评测指标
 
-#### 指标 1：CEval physician（医学资格）
+#### 指标 1：CEval 医疗子任务（当前真实项目口径）
 - **任务形式**：4选1单选题，考察医学知识掌握程度
 - **评测方式**：0-shot 或 5-shot（few-shot）accuracy
 - **基准水平**：随机猜测 25%，未微调 Llama3.2-3B 约 35~40%
 
 ```
-SFT 后：CEval physician accuracy: xx% → xx%（↑N 个百分点）
+你当前真实项目里，更适合直接讲这三组结果：
+- `SFT baseline`：`basic_medicine = 0.5789`，`clinical_medicine = 0.5000`
+- `DPO vs SFT`：`basic_medicine 0.5789 -> 0.4737`，`clinical_medicine 0.5000 -> 0.5000`
+- `Random SFT(500) vs Retrieved_t70 SFT(207)`：`basic_medicine 0.5789 -> 0.5789`，`clinical_medicine 0.4545 -> 0.5000`
+
+这组结果非常适合回答“为什么你认为数据分布对齐比直接上 DPO/PPO 更能带来 benchmark 收益”。
 ```
 
 #### 指标 2：PPL（Perplexity，困惑度）
@@ -402,8 +521,13 @@ SFT 后：CEval physician accuracy: xx% → xx%（↑N 个百分点）
 - **评测语料**：在 1k 医疗领域测试文本上计算 PPL
 
 ```
-训练前 PPL：xxx
-SFT 后 PPL：xxx（↓改善 xx%）
+你当前真实项目里，RM 阶段已经有一条可引用的 PPL 相关记录：
+- RM eval 输出里 `perplexity = 4.3000`
+
+但这里要主动说明一个八股原理：
+> PPL 下降不一定代表模型整体更好。它只说明模型在该语料分布上的建模更强；如果语料分布本身偏窄，或者模型为了适应医疗风格牺牲了通用能力，PPL 也可能“好看但不代表泛化更强”。
+
+所以你当前项目里更稳妥的做法是：把 PPL 作为训练状态的辅助指标，而把 CEval 和开放问答样例作为主评测证据。
 ```
 
 #### 指标 3：偏好胜率（Win Rate）
@@ -473,7 +597,7 @@ Base Model：Llama3.2-3B / Qwen2.5-3B
 
 ### Q1：为什么选 3B 量级的模型？
 
-> A：资源约束下的权衡。3B 模型用 LoRA 单卡（A100 40G）可完成 SFT，PPO 阶段 4 模型也可用 2 卡完成。更重要的是，医疗问答任务对模型的知识深度要求高但对通用推理能力要求相对稳定，3B 模型经过良好的 SFT+RLHF 后在 CEval 医学子集上的表现并不明显弱于 7B——边际收益递减，而 7B 训练成本翻了约 2~3 倍。
+> A：更稳妥的回答是“资源约束下优先保证完整闭环和可解释消融”。你当前真实主线选的是 `Qwen2.5-0.5B`，不是因为它一定最强，而是因为它能在单卡 24G/48G 环境下把 SFT、RM、DPO、PPO 最小闭环和统一评测全部跑通。这里的八股原理是：对面试项目来说，先验证方法是否有效，比一开始盲目上更大模型更重要；而且模型变大并不自动带来收益，如果数据分布和目标评测不对齐，3B 甚至可能比 0.5B 更系统地学到偏差。
 
 ### Q2：如何确保合成数据的质量？
 
