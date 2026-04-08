@@ -165,6 +165,53 @@ GraphRAG 的优势是先把设备、工艺步骤、参数、缺陷、原因、�
 - 7B 和 14B 词表匹配为什么重要
 - 多卡隔离怎么做的
 
+### 追问：多卡隔离怎么做的
+
+**回答**
+
+多卡隔离不是简单把模型“放到多张卡上”，而是把**生成服务**和 **embedding 服务**按职责拆成两个独立后端，再分别绑定不同 GPU。
+
+**代码层面**主要有两步：
+
+1. **vLLM 生成服务单独绑卡**
+   - 在 `vllm.sh` 里通过 `CUDA_VISIBLE_DEVICES` 控制 vLLM 只能看到指定 GPU
+   - 例如生成侧使用：
+   ```bash
+   CUDA_VISIBLE_DEVICES=1,2 \
+   MODEL_PATH=/mnt/data2/ycl/graphrag/Qwen2.5-Coder-14B-Instruct \
+   TENSOR_PARALLEL_SIZE=2 \
+   bash vllm.sh
+   ```
+   - 这样 vLLM 只会使用 1、2 号卡提供 `http://127.0.0.1:8000/v1` 的 completion/query 服务
+
+2. **GraphRAG 配置里把生成和 embedding 分开路由**
+   - 在 `settings.vllm.yaml` 中：
+     - `default_completion_model` 和 `query_completion_model` 指向 `http://127.0.0.1:8000/v1`
+     - `default_embedding_model` 指向 `http://127.0.0.1:11434/v1`
+   - 这意味着：
+     - 生成请求走 vLLM
+     - embedding 请求走 Ollama
+
+**运行层面**，我最终采用的是：
+
+- `vLLM`: 负责生成，固定到 `GPU 1,2`
+- `Ollama`: 负责 embedding，固定到 `GPU 0`
+
+这样做的原因是我在实验里确实遇到过资源争抢：
+
+- 如果 vLLM 和 Ollama 共用同一张卡
+- completion 看起来能正常返回
+- 但 embedding 会在尾部阶段卡住，GraphRAG 停在 `generate_text_embeddings`
+
+把两类服务拆到不同 GPU 后，问题就收敛了：
+
+- vLLM 主生成链路稳定完成
+- embedding 侧不再和生成侧抢显存
+- 后续再把 embedding 模型从 `bge-m3` 换成 `mxbai-embed-large` 后，全流程才最终闭环
+
+**一句话总结**：
+多卡隔离的本质不是为了“看起来更高级”，而是为了让生成和 embedding 两条负载解耦，避免共享同一张 GPU 导致长时运行下的显存竞争和接口卡死。
+
 ### 注意事项
 
 - 用现象倒推定位问题（延迟上升→超时→缓存管理）
@@ -797,6 +844,34 @@ Query → Query NER → 实体链接 → 语义检索
 - 投机解码为什么能加速
 - 7B 和 14B 词表必须匹配吗
 - 为什么还要保留 Ollama
+
+### 追问：为什么还要保留 Ollama
+
+**回答**
+
+我在这条实验线里并不是把所有服务一次性都迁到 vLLM，而是先做**生成侧对比**，把变量控制住。
+
+具体做法是：
+
+- completion/query：迁到 vLLM
+- embedding：先保留在 Ollama
+
+这样做有两个原因：
+
+1. **先控制变量**
+   - 如果一开始把 completion 和 embedding 两层都一起替换，后面性能变化就很难判断到底来自哪一层
+   - 先只替换生成侧，可以更清楚比较 Ollama 和 vLLM 在高并发抽取阶段的吞吐和稳定性差异
+
+2. **embedding 在这套链路里本来就是独立故障点**
+   - 我后面发现，`bge-m3` 在 Ollama `/v1/embeddings` 路径上会出现 `NaN/500`
+   - 所以生成侧迁到 vLLM 后，主链路已经明显改善，但最后仍可能被 embedding 后端拖住
+
+后续我再把 embedding 模型替换成 `mxbai-embed-large`，才把整条链路收尾跑通。
+
+所以保留 Ollama 不是因为 vLLM 不行，而是：
+
+- 前期为了控制变量
+- 后期为了把生成优化和 embedding 稳定性拆开分析
 
 ### 注意事项
 
