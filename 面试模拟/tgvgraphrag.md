@@ -675,6 +675,11 @@ RELATIONSHIPS = [
     "DEFECT_RELATED_TO_PARAMETER",  # 缺陷关联参数
     "DEFECT_RELATED_TO_STEP",  # 缺陷关联工序
     "CAUSE_RELATED_TO_TOOL",   # 原因关联设备
+    "CAUSES",                  # 明确因果触发
+    "LEADS_TO",                # 过程性导致
+    "RESULTS_IN",              # 结果导向关系
+    "MITIGATES",               # 缓解/抑制
+    "PRECEDES",                # 时序先后
     
     # 证据关系
     "RULE_SUPPORTS_CAUSE",     # 规则支持原因
@@ -697,6 +702,7 @@ RELATIONSHIPS = [
 - 保留参数阈值和适用范围
 - 减少错误泛化
 - 支持条件化检索
+- 为后续 directional causal retrieval 提供更强的边语义
 
 ### 9.2 Prompt 工程：保守抽取与证据绑定
 
@@ -708,6 +714,7 @@ RELATIONSHIPS = [
 2. **条件保留**：关系必须包含适用条件（参数范围、材料类型）
 3. **证据绑定**：每个关系必须标注来源文档和段落
 4. **术语标准化**：使用统一工业术语（如"激光诱导"而非"激光打孔"）
+5. **定向因果优先**：对因果关系优先使用 `CAUSES / LEADS_TO / RESULTS_IN / MITIGATES / PRECEDES`，避免全部退化为弱关联边
 
 **关键 Prompt 片段**：
 
@@ -738,7 +745,12 @@ Extraction Principles:
 
 ### 9.3 Query NER 联合解码机制
 
-针对工艺评估查询中长文本实体易遗漏的问题，设计了轻量级实体抽取链路。
+针对工艺评估查询中长文本实体易遗漏的问题，这条链路按“双版本”设计：
+
+- **当前落地版**：轻量启发式 Query NER + Fuzzy Linking
+- **演进版**：BERT 候选实体抽取 + Fuzzy Linking + 检索融合
+
+当前仓库里已经完整跑通的是轻量版；而 BERT 版是为了让 Query NER 更适合工业长 query、多实体和复杂边界情况，是后续把链路补齐到正式工业方案的升级方向。
 
 #### 9.3.1 设计原理与动机
 
@@ -754,12 +766,28 @@ Extraction Principles:
 3. **成本更低**：无需调用大模型 API
 4. **可解释性强**：抽取逻辑透明，便于调试
 
+**为什么还要规划 BERT 版？**
+
+因为工业 query 往往有三个额外难点：
+
+1. query 很长，单靠规则抽取容易丢边界信息
+2. 术语别名、设备编号、缺陷名混在自然语言里，pattern 很不稳定
+3. 不同 query 类型（关系、因果、建议）对候选实体精度要求更高
+
+所以更完整的工业方案是：
+
+- BERT 负责抽候选实体 span
+- Fuzzy Linking 负责对齐知识库标准实体
+- 向量检索负责补召回
+
 **联合解码的核心思想**：
-将精确匹配（NER）与模糊匹配（Fuzzy Linking）相结合，既保证召回率，又提高准确率。
+将候选实体抽取、实体对齐和语义检索三路信息结合起来，既保证 recall，又尽量保留 query 的任务意图。
 
 #### 9.3.2 架构设计
 
 ```
+当前落地版：
+
 用户查询 → Query NER (启发式) → Fuzzy Linking → 实体锚点
                 ↓                      ↓
           ~0.2ms 延迟          ~2ms 延迟
@@ -769,6 +797,16 @@ Extraction Principles:
                         与语义检索融合
                               ↓
                          指导子图召回
+
+演进版：
+
+用户查询 → BERT Query NER → Fuzzy Linking → 实体锚点
+                ↓                    ↓
+           span 级候选          标准实体对齐
+                ↓                    ↓
+            保留边界信息        与语义检索融合
+                               ↓
+                         指导 HybridSearch
 ```
 
 #### 9.3.3 核心实现（改进版）
@@ -844,6 +882,36 @@ def get_entity_by_name_fuzzy(entities_dict, name, fuzzy_threshold=0.8):
     
     return [ent for title, ent in candidates if title in matches]
 ```
+
+#### 9.3.3.1 BERT 演进接口骨架
+
+为了让这条链路与正式工业方案对齐，仓库中已经预留了 BERT 版 Query NER 的接口骨架：
+
+```python
+# 文件: scripts/custom_modules/query_entity_extractor_bert.py
+
+@dataclass
+class EntitySpan:
+    text: str
+    start: int
+    end: int
+    label: str = "ENTITY"
+    score: float = 0.0
+
+
+class BertQueryEntityExtractor:
+    def extract_spans(self, query: str) -> list[EntitySpan]:
+        ...
+
+    def extract(self, query: str) -> list[str]:
+        ...
+```
+
+这个设计的目的是：
+
+- 不推翻当前已验证的轻量链路
+- 让后续 BERT Query NER 可以无缝替换启发式前端
+- 保持后面的 Fuzzy Linking、子图挖掘、HybridSearch 不变
 
 #### 9.3.4 关键改进与八股原理
 

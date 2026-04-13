@@ -282,6 +282,108 @@ GraphRAG 索引阶段的 Map-Reduce 是怎么工作的？你为什么需要优�
 - 社区发现算法是什么，起什么作用
 - 如果 Map 阶段并发太高会有什么问题
 
+### 追问：Map 阶段失败一个 chunk 怎么处理
+
+**回答**
+
+这个问题要分成**单次请求层**和**整轮索引层**两层来看。
+
+**第一层：单次请求层**
+
+在当前配置里，GraphRAG 的 completion 和 embedding 都启用了重试：
+
+- `settings.vllm.yaml` 里 completion/query 使用 `retry: exponential_backoff`
+- embedding 模型也使用 `retry: exponential_backoff`
+
+所以一个 chunk 对应的一次 LLM 请求如果只是短时抖动，例如：
+
+- 瞬时超时
+- 连接错误
+- 后端短暂 500
+
+会先走**指数退避重试**，而不是立刻判整个 workflow 失败。
+
+**第二层：整轮索引层**
+
+如果某个 chunk 在重试后还是失败，GraphRAG 的当前 workflow 一般不会“跳过这个 chunk 继续往后”，而是：
+
+- 当前 workflow 记为失败
+- 日志里能看到具体失败的阶段
+- 但已经成功写入的 cache 和中间产物仍然保留
+
+这也是为什么我前面一直强调：
+
+- 不要轻易 `--clean`
+- 优先保留 `cache/` 和已完成的 `output/`
+- 修复问题后再续跑
+
+比如我之前在 embedding 阶段遇到 `NaN/500` 时，并不是把前面 `extract_graph` 和 `community_reports` 全部重做，而是：
+
+- 保留已有产物
+- 只修 embedding 后端
+- 再重新跑索引
+
+这样已经成功的 chunk 结果可以复用，失败的阶段重新执行即可。
+
+**工程上可以怎么讲**
+
+> Map 阶段单个 chunk 失败时，先依赖请求级重试处理短时波动；如果重试后仍失败，当前 workflow 会停下来，但前面已成功的缓存和中间结果不会丢。我实际处理时会保留 cache 和 output，修复故障点后续跑，而不是每次全量重跑。
+
+### 追问：Reduce 阶段怎么判断两个实体是同一个
+
+**回答**
+
+在原生 GraphRAG 里，这一步更接近**归一化聚合**，而不是完整意义上的工业级实体对齐系统。
+
+它的核心思路是：
+
+1. **Map 阶段先从不同 chunk 抽出局部实体**
+   - 每个 chunk 都可能抽出自己的实体列表
+   - 同一个实体会在多个 chunk 里重复出现
+
+2. **Reduce 阶段按规范化后的实体名做聚合**
+   - 例如同名或高度一致的 `title`
+   - 再把不同 chunk 中关于它的描述汇总
+
+3. **后续通过 `summarize_descriptions` 合并描述**
+   - 也就是把多个局部描述整理成一个全局描述
+   - 最终形成实体表里的：
+     - `title`
+     - `description`
+     - `frequency`
+     - `degree`
+
+所以它本质上依赖的是：
+
+- 名称一致性
+- prompt 抽取风格一致性
+- 前置清洗和术语归一
+
+而不是一个特别复杂的 learned entity resolution 模型。
+
+**为什么前面的清洗和术语标准化很重要**
+
+因为如果同一个工业对象被写成不同形式，例如：
+
+- `Laser-01`
+- `LASER01`
+- `laser tool 01`
+
+那 Reduce 阶段就可能把它们当成不同实体，或者至少增加后续合并成本。
+
+这也是为什么我在工业化改造里会特别强调：
+
+- 术语归一
+- 设备命名标准化
+- 参数单位统一
+- 别名字典维护
+
+这些工作本质上是在帮助 Reduce 阶段更稳定地把“同一个东西”聚到一起。
+
+**更准确的表述方式**
+
+> 原生 GraphRAG 的 Reduce 阶段主要是基于实体名称和描述的一致性做聚合，再通过描述摘要形成全局实体表示。它不是一个完整的工业实体对齐系统，所以我在二开时会把术语归一、别名映射和 schema 约束前移，尽量在进入 Reduce 之前就减少同物异名。
+
 ### 注意事项
 
 - Map-Reduce 是 GraphRAG 索引的核心机制，要讲清楚
@@ -390,7 +492,27 @@ linked = fuzzy_link(extracted, entities_dict)  # ~8ms
 
 ### 回答
 
-针对工艺评估查询中长文本实体易遗漏的问题，我设计了两阶段机制：
+针对工艺评估查询中长文本实体易遗漏的问题，我把 Query NER 联合解码设计成了**双版本架构**：
+
+1. **当前落地版**：轻量启发式 Query NER + Fuzzy Linking  
+   - 目标是保证查询阶段高频、低时延、稳定
+   - 这是当前仓库里已经落地并用于实验的版本
+
+2. **演进版**：BERT 候选实体抽取 + Fuzzy Linking + 检索融合  
+   - 目标是更好处理长 query、多实体、复杂边界和工业术语变体
+   - 这是为了让整条链路更贴近“Query NER 联合解码”的正式工业方案
+
+也就是说，当前代码里已经完整落地的是：
+
+- 候选实体抽取
+- Fuzzy Linking
+- 与检索链路融合
+
+而 BERT 版是我后续补齐到正式工业实现时的升级方向，接口和链路已经按这个方向收拢。
+
+### 当前落地版：轻量 Query NER
+
+当前用于实验验证的是轻量方案：
 
 **阶段一：Query NER 实体抽取（改进版）**
 ```python
@@ -461,6 +583,61 @@ def get_entity_by_name_fuzzy(entities_dict, name, threshold=0.8):
 - NER 结果（精确匹配）优先级高于语义检索
 - 构建查询锚点，指导子图召回方向
 
+### 演进版：BERT Query NER + Fuzzy Linking
+
+如果按简历里的正式表述继续往前收敛，推荐的升级方式不是推翻当前链路，而是在 Query NER 前端增加一个 BERT 候选抽取器。当前仓库里我已经补了一个**可跑的 BERT-assisted prototype**：
+
+- 代码：`scripts/custom_modules/query_entity_extractor_bert.py`
+- 验证脚本：`scripts/verify_bert_query_ner.py`
+- 模型：本地 `bert-base-chinese`
+- 当前定位：**BERT 辅助候选抽取 + 领域词表约束 + Fuzzy Linking**
+- 口径说明：这是 runnable prototype，不是已经完成监督训练的工业终版 NER
+
+```python
+class BertQueryEntityExtractor:
+    """
+    目标角色：
+    1. 从长 query 中抽取 span 级候选实体
+    2. 输出候选文本 + span 边界 + 类型 + 置信度
+    3. 将候选传给 Fuzzy Linking 做标准实体对齐
+    """
+
+    def extract_spans(self, query: str) -> list[EntitySpan]:
+        ...
+```
+
+推荐链路会变成：
+
+```text
+原始 Query
+→ BERT 抽候选实体 span
+→ Fuzzy Linking 对齐标准实体
+→ 与向量检索结果按优先级融合
+→ 进入子图挖掘与 HybridSearch
+```
+
+这样当前代码和简历口径就能对齐成：
+
+- 当前原型：启发式 Query NER 先验证链路可行性与时延
+- 当前增强版：BERT-assisted prototype 负责更复杂 query 的候选抽取与候选打分
+- 正式工业版：在 prototype 基础上补齐监督训练、type-aware linking 与系统评测
+
+### 联合解码里的“联合”具体体现在哪里
+
+“联合”不是指一个模型里同时解两个任务，而是指**三路信息联合参与后续检索**：
+
+1. Query NER 抽出的候选实体
+2. Fuzzy Linking 对齐后的知识库标准实体
+3. 向量检索召回的语义相关实体 / 文本块
+
+实际融合原则是：
+
+- **NER 精确命中的实体优先级最高**
+- **Fuzzy Linking 作为别名/缩写纠偏层**
+- **向量检索负责补召回**
+
+所以 Query NER 不会替代原始 query，而是给 HybridSearch 提供高置信度锚点。
+
 **关键修复案例**：
 ```
 查询: "What is the relationship between Scrooge and Marley?"
@@ -476,9 +653,46 @@ NER 抽取:       ~0.2ms
 停用词覆盖率:   300+ 常见虚词/动词/噪声名词
 ```
 
+### BERT Prototype 验证结果
+
+我后来把这条链路补成了一个**实际可运行的 BERT Query NER 原型**，并在 `TGV-mini` 查询样例上做了快速验证。
+
+**验证命令**：
+```bash
+/home/ycl1234/miniconda3/envs/graphrag/bin/python scripts/verify_bert_query_ner.py
+```
+
+**样例结果**：
+```text
+[1] LOT-20260401-A03 在 LASER-01 的 pulse_energy 漂移为什么会导致 hole_wall_roughness？
+Predicted: ['LOT-20260401-A03', 'LASER-01', 'pulse_energy', 'hole_wall_roughness']
+
+[2] 如何降低 PVD-04 在 barrier_deposition 后出现的 barrier_coverage_nonuniformity？
+Predicted: ['PVD-04', 'barrier_deposition', 'barrier_coverage_nonuniformity']
+
+[3] PLATE-01 的 bath_temperature 下降和 copper_fill_void 有什么关系？
+Predicted: ['PLATE-01', 'TEM', 'copper_void', 'bath_temperature', 'copper_fill_void']
+
+[4] CLEAN-02 的 rinse_conductivity 异常会不会引起 carryover_contamination？
+Predicted: ['CLEAN-02', 'rinse_conductivity', 'carryover_contamination']
+```
+
+**当前阶段结论**：
+- 4 条 TGV-mini query 的目标实体命中率：`13/13 = 100%`
+- 对设备 ID、LOT ID、工艺参数、缺陷名这类结构化术语识别效果较稳
+- 仍存在少量“补召回式”噪声候选，例如 `TEM`、`copper_void` 这类与 query 语义相关但非主目标实体
+
+所以最准确的项目口径应该是：
+
+- **当前已落地**：启发式 Query NER + Fuzzy Linking + HybridSearch 原型
+- **当前已补充**：可跑的 BERT-assisted Query NER prototype
+- **后续继续完善**：真正面向工业 query 的监督式 BERT NER、type-aware linking、intent-aware rerank
+
 ### 追问
 
 - 为什么不用 LLM 做 NER
+- 为什么当前代码先用启发式，而不是直接上 BERT
+- BERT 版 Query NER 在整条链路里应该放在哪一层
 - Fuzzy matching 的 threshold 怎么选
 - 如果实体链接错了怎么办
 - 联合解码的"联合"体现在哪里
@@ -487,8 +701,177 @@ NER 抽取:       ~0.2ms
 ### 注意事项
 
 - 强调"高频、低时延、稳定"是查询阶段的核心诉求
+- 当前仓库落地的是轻量版；BERT 是为了把正式工业实现补齐到简历口径的演进方向
 - "联合"指 NER + Linking + 检索的协同
 - 主动提**停用词过滤**是解决整句误抽的关键
+
+### 新增：关系问句为什么还要做 Structured Retrieval Plan？
+
+如果 query 是：
+
+```text
+What is the relationship between Scrooge and Marley?
+```
+
+只做普通 Query NER + 子图扩展，系统往往会返回：
+
+- 与 Scrooge 相关的背景
+- 与 Marley 相关的背景
+- 一堆主题中心节点
+
+但这并不等于回答了“他们之间是什么关系”。
+
+所以我后来把这类 query 单独语义化成：
+
+```text
+intent = relation_query
+subject = SCROOGE
+object = MARLEY
+target = direct_relation | shortest_relation_path
+```
+
+然后检索阶段优先：
+
+1. 找直接边
+2. 找最短桥接路径
+3. 最后才补背景实体
+
+这样输出就不再是“背景知识堆叠”，而是直接对准关系本身。
+
+**一句话八股原理**：
+
+> 对关系问句，检索目标应该从“相关性最大”切换成“连接性最强”。
+
+### 新增：为什么因果问句也要单独做 Structured Retrieval Plan？
+
+因为因果问句问的不是：
+
+- 哪些内容和这个问题相关
+
+而是：
+
+- 谁导致了谁
+- 哪条因果链最强
+- 哪些证据支持这个判断
+
+所以像：
+
+```text
+Why did pulse_energy_drift lead to hole_wall_roughness?
+```
+
+内部要先语义化成：
+
+```text
+intent = causal_query
+subject = pulse_energy_drift
+object = hole_wall_roughness
+target = root_cause | causal_chain | supporting_evidence
+```
+
+然后检索阶段优先：
+
+1. 找因果词更强的路径
+2. 找更贴近 effect 的路径
+3. 再按 hop 和权重排序
+
+最后 Narrator 也不能再只是列背景，而要优先输出：
+
+- strongest causal chain
+- supporting evidence
+- related context
+
+**一句话八股原理**：
+
+> 对因果问句，系统要从“找相关信息”切换成“找解释链和证据链”。 
+
+### 新增：为什么 causal query 还会答偏，应该怎么修？
+
+当前 causal query 的一个典型现象是：
+
+- planning 已经能得到 `intent=causal_query`
+- 也能抽出 `subject` 和 `effect focus`
+- 但最终 strongest path 仍可能被 `SPIRIT` 这类高连接度节点抢走
+
+这说明问题不在 query planning，而在 execution。
+
+我把根因拆成两层：
+
+1. **BERT Query NER 缺少 domain gating**
+   - 文学 query 里仍可能冒出 `AOI`、`seed_deposition` 这类工业术语
+   - 说明候选被错误投影到了工业词表空间
+
+2. **causal ranking 缺少 effect anchoring**
+   - 虽然 plan 里已经有 `object=...`
+   - 但如果排序阶段不强约束路径必须覆盖 effect 相关锚点
+   - strongest path 还是会退化成“图上强相关”，而不是“问句对齐”
+
+当前修法是：
+
+- 在 `query_entity_extractor_bert.py` 中加入 query domain gating
+- 在 `subgraph_mining.py` 中把 `rank_causal_paths(...)` 升级为：
+  - subject 覆盖加分
+  - effect anchor 覆盖加分
+  - subject + effect 同时命中优先
+  - 重复节点惩罚
+- 在 `verify_bert_retrieval_bridge.py` 中把 causal seed 选择从“前两个 linked entities”改成“subject -> effect -> 其余实体”的顺序，保证 effect 相关节点真正进入子图扩展
+- 在 `graph_narrator.py` 中把 causal answer 从 top-1 单路径输出，升级成“主路径 + Additional Supporting Causal Paths”的 top-k 共识式输出
+- 在 `subgraph_mining.py` 中把节点层匹配从严格相等升级为包含式命中，并补了 `visit / ghost / warn / transformation` 这类更贴近文学因果语义的加权
+- 在 `graph_narrator.py` 中继续补了 `causal answer synthesis`，会先从 top-k 路径抽 explanation fragments，再生成一条更自然的 why-answer
+- 在 `subgraph_mining.py` 中新增了 `build_directed_causal_candidates(...)`，让 causal retrieval 不再完全按无向邻接扩图，而是优先沿 `source -> target` 方向走，并对逆向边降权
+- 同时把 `prompts-tgv/extract_graph.txt` 收紧成更明确的定向关系类型：`CAUSES / LEADS_TO / RESULTS_IN / MITIGATES / PRECEDES`
+
+最新回归结果也说明这个方向是有效的：
+
+- 文学 query 不再误抽 `AOI / seed_deposition / via_offset`
+- 关系问句 `What is the relationship between Scrooge and Marley?` 仍然能保持 direct edge 命中
+- 因果问句虽然还没完全答到位，但 strongest path 已经从 `SPIRIT` 抢主链，进一步收敛到 `MARLEY / SCROOGE` 主轴附近，并且 `CHRISTMAS` 已经开始进入 Additional Supporting Causal Paths；Narrator 也会先给出一条 why-answer summary，而不是只展示路径
+- 方向优先检索接入后，系统已经不再完全把 causal query 当无向邻接路径问题来做，这也更符合“因果图检索”的设计目标
+
+**一句话八股原理**：
+
+> causal query 的难点不只是“识别是因果问题”，而是让检索执行真正围绕 cause 和 effect 收敛，而不是被图里的高连接度节点带偏。
+
+### 新增：现在的边是不是无向的，这和抽取阶段设计有没有关系？
+
+更准确地说，不是“图里完全没有方向”，而是：
+
+1. **存储层有 `source / target` 字段**
+   - 所以图谱关系表不是完全无向边集
+
+2. **但抽取层之前没有把因果方向建模得足够强**
+   - 关系更多像“有关系”
+   - 而不是严格的 `CAUSES / RESULTS_IN / MITIGATES / PRECEDES`
+
+3. **检索层又为了提高召回，把边按无向邻接使用**
+   - 这就让 causal retrieval 更像“相关路径搜索”
+   - 不像“严格方向因果链搜索”
+
+所以根因是两层叠加：
+
+- 抽取层方向语义偏弱
+- 检索层把弱方向进一步当成无向图处理
+
+当前已经开始往这两层同时修：
+
+**抽取层**
+- 在 `prompts-tgv/extract_graph.txt` 中把关系类型收紧成更明确的定向类型：
+  - `CAUSES`
+  - `LEADS_TO`
+  - `RESULTS_IN`
+  - `MITIGATES`
+  - `PRECEDES`
+- 并且要求 `relationship_type` 真正输出进关系结构
+
+**检索层**
+- 在 `subgraph_mining.py` 中新增 `build_directed_causal_candidates(...)`
+- causal retrieval 不再完全按无向邻接扩图，而是：
+  - 优先沿 `source -> target` 方向走
+  - 逆向边允许保召回，但会降权
+
+**一句话八股原理**：
+
+> 图谱有没有 `source/target` 字段，不等于系统已经在做强因果图检索；真正的因果图要同时依赖“强类型定向边 + 方向优先的候选路径生成”。
 
 ---
 
@@ -1171,6 +1554,361 @@ Query → Query NER → 实体链接 → 语义检索
 
 - 强调这是"结构化信息到自然语言上下文"的桥接层
 - 不要说成图谱没用，而是图谱负责组织，自然语言负责表达
+
+---
+
+## 19A. 查询理解与模型基础追问
+
+### 问题 1
+
+大模型做实体抽取会导致搜索词丢失额外信息、信息熵减少，这个问题怎么解决？
+
+### 回答
+
+这个问题的本质是：**如果把原始 query 直接压缩成几个实体名，虽然方便检索，但会损失 query 里的约束、语气、目标和比较关系。**
+
+例如用户问：
+
+> `What is the relationship between Scrooge and Marley?`
+
+如果只留下：
+
+- `SCROOGE`
+- `MARLEY`
+
+那就丢了下面这些信息：
+
+- 用户问的是 **relationship**
+- 不是单实体介绍
+- 不是主题概览
+- 也不是开放式总结
+
+这就是“信息熵减少”的工程表现：**query 从一个带任务意图的语义表达，被压缩成了几个离散锚点。**
+
+所以正确做法不是“让实体抽取替代 query”，而是把它作为**查询理解的一部分**。我通常会把 query 拆成两条并行信号：
+
+1. **实体锚点信号**
+   - 用轻量 Query NER 抽出显式实体
+   - 作用是保证关键对象不漏
+
+2. **语义任务信号**
+   - 保留原始 query
+   - 用来识别这是“关系问答 / 因果问答 / 比较问答 / 建议问答”
+   - 指导后续的子图召回、排序和模板输出
+
+也就是说：
+
+- **实体抽取解决 recall**
+- **原始 query 解决 intent 和约束保留**
+
+在你当前代码里，落地的是第一部分：
+
+- `QueryEntityExtractor.extract(query)`
+- `get_entity_by_name_fuzzy(...)`
+
+对应文件：
+- [query_entity_extractor.py](/mnt/data2/ycl/graphrag/scripts/custom_modules/query_entity_extractor.py)
+
+如果后续继续加强，我建议在这之上再补一层：
+
+- query intent classification
+- relation-aware ranking
+- constraint extraction（如时间、比较对象、因果方向）
+
+**八股原理总结**：
+
+| 设计问题 | 原理 | 工程结论 |
+|---|---|---|
+| 为什么只做实体抽取不够 | 实体是 query 的一部分，不是 query 全部语义 | 实体锚点和原始语义必须并行保留 |
+| 为什么会“信息熵减少” | 任务意图、比较关系、因果方向在实体压缩时会丢失 | 不能把 NER 输出当成 query 的替身 |
+| 应该怎么做 | 显式实体 + 原始 query + 检索融合 | 两路信息同时参与召回和排序 |
+
+### 追问
+
+- 如果 query 里没有明确实体怎么办
+- 如果 query 是比较型问题怎么办
+- 如果 query 包含条件约束（时间、设备、批次）怎么办
+
+### 问题 2
+
+如何将 query 语义化？
+
+### 回答
+
+“query 语义化”不是把一句话改写得更漂亮，而是把原始问题拆成几个可计算的语义信号，供后面的检索和推理模块使用。
+
+我建议把 query 语义化拆成 4 层：
+
+1. **实体层**
+   - query 里提到了哪些核心对象
+   - 如设备、缺陷、工序、参数、人物名
+
+2. **意图层**
+   - 用户是在问：
+     - 定义
+     - 关系
+     - 原因
+     - 建议
+     - 对比
+     - 趋势
+
+3. **约束层**
+   - 是否有时间、批次、工序阶段、设备、空间范围等限制
+
+4. **输出层**
+   - 应该返回：
+     - 事实答案
+     - 因果链
+     - 证据列表
+     - 建议项
+
+拿你当前项目举例，query 语义化最自然的流程是：
+
+```text
+原始 Query
+→ Query NER 抽实体
+→ Fuzzy Linking 对齐知识库实体
+→ 识别 query 类型（关系 / 因果 / 比较 / 建议）
+→ 根据类型决定检索策略
+   - relation: 双实体桥接路径优先
+   - causal: 2-3 hop 因果链优先
+   - suggestion: 缺陷→原因→措施链优先
+→ 再做 Global/Local/Hybrid 检索
+```
+
+你现在仓库里已经落地的是前半段：
+
+- Query NER
+- Fuzzy Linking
+- 子图挖掘
+- GraphNarrator
+
+对应文档位置：
+- [tgvgraphrag.md](/mnt/data2/ycl/graphrag/doc/tgvgraphrag.md#L739)
+
+如果你面试被问“query 语义化具体怎么做”，一个很稳的回答是：
+
+> 我不会直接把 query 当字符串丢给向量检索，而是先做语义拆解：先抽实体锚点，再识别 query 是关系、因果还是建议类问题，然后按问题类型决定后面的子图扩展和上下文构造方式。
+
+**八股原理总结**：
+
+| 语义化层次 | 作用 | 典型方法 |
+|---|---|---|
+| 实体层 | 把 query 锚到知识库节点 | Query NER + Linking |
+| 意图层 | 决定检索模式 | 规则 / 分类器 / prompt 路由 |
+| 约束层 | 保留时间、批次、工序等限制 | regex / parser / slot filling |
+| 输出层 | 决定回答模板 | Local / Global / Hybrid + Narrator |
+
+### 追问
+
+- 如何识别关系型 query 和因果型 query
+- 如何把约束条件传递给检索器
+- 语义化和 query rewrite 的区别是什么
+
+### 问题 3
+
+说一下 BERT 结构，BERT 对中文可不可以做字和词的区分？
+
+### 回答
+
+BERT 的核心结构可以概括成：
+
+1. **输入层**
+   - Token Embedding
+   - Position Embedding
+   - Segment Embedding
+
+2. **编码层**
+   - 多层 Transformer Encoder
+   - 每层都包含：
+     - Multi-Head Self-Attention
+     - Feed Forward Network
+     - Residual Connection
+     - LayerNorm
+
+3. **预训练目标**
+   - MLM（Masked Language Modeling）
+   - NSP（原始 BERT 里有，很多后续中文模型会弱化或替换）
+
+所以它本质上是一个：
+
+> 基于双向 self-attention 的上下文编码器
+
+**BERT 对中文能不能区分字和词？**
+
+能，但要把“区分”说准确：
+
+- 原生中文 BERT 通常主要以**字 / 子词粒度**做 tokenization
+- 它不天然像传统分词器那样先切出稳定词边界
+- 但通过上下文 self-attention，它可以在表示空间里学到“哪些字组合成词、短语、实体”
+
+换句话说：
+
+- **输入上**更偏字或子词
+- **表示上**可以隐式建模词级语义
+
+所以如果面试官问：
+
+> 中文 BERT 能不能区分字和词？
+
+一个准确回答是：
+
+> 可以做，但不是靠显式词边界，而是通过字/子词级输入 + 上下文建模，在隐空间里学到词级组合关系。如果业务特别依赖词边界，可以再叠加中文分词、词典特征或 lexicon-aware 模型。
+
+**结合你当前项目的口径**
+
+当前仓库里的 Query NER 不是 BERT 版，而是启发式版。  
+如果你以后真要做 BERT Query NER，更合理的落地方向是：
+
+- 输入：中文 query 字/子词序列
+- 输出：BIO/BIESO 序列标注
+- 后处理：实体 span -> alias normalization -> fuzzy linking
+
+**八股原理总结**：
+
+| 点 | 结论 |
+|---|---|
+| BERT 结构 | 输入嵌入 + 多层 Transformer Encoder + MLM 预训练 |
+| 中文输入粒度 | 更偏字 / 子词，而不是强依赖显式分词 |
+| 能不能区分词 | 能在表示空间中隐式建模词级语义 |
+| 什么时候要额外做词级增强 | 实体边界敏感、术语词典强依赖、行业缩写多的场景 |
+
+### 追问
+
+- 中文 BERT 为什么不一定先做分词
+- BERT 和 BiLSTM-CRF 做 NER 的差别是什么
+- WordPiece / SentencePiece 对中文有什么影响
+
+### 问题 4
+
+说一下 LN 和 BN，以及分别适合什么场景。
+
+### 回答
+
+BN 和 LN 都是归一化方法，但归一化维度不同，因此适用场景也不同。
+
+## BatchNorm（BN）
+
+BN 是在 **batch 维度** 上做归一化。  
+它用一个 batch 内的均值和方差来标准化当前层输出。
+
+特点：
+
+- 依赖 batch statistics
+- 对 batch size 比较敏感
+- 在 CNN / 视觉任务里非常常见
+- 对大 batch 训练比较友好
+
+优点：
+
+- 训练更稳定
+- 收敛更快
+- 对卷积网络尤其有效
+
+缺点：
+
+- 小 batch 效果容易变差
+- 在线推理和训练统计不完全一致
+- 在序列模型、变长输入、batch 很小的场景不够稳
+
+## LayerNorm（LN）
+
+LN 是对 **单个样本内部的特征维度** 做归一化。  
+不依赖同 batch 其他样本。
+
+特点：
+
+- 不依赖 batch size
+- 对变长序列更稳定
+- 特别适合 Transformer / NLP
+
+优点：
+
+- 训练和推理行为更一致
+- 很适合小 batch 或 batch size 波动大的场景
+- 更适合文本、序列、在线服务
+
+缺点：
+
+- 在某些 CNN 场景下不如 BN 高效
+- 不能直接享受“大 batch 统计稳定”的好处
+
+## 分别适合什么场景
+
+| 方法 | 更适合的场景 |
+|---|---|
+| BN | CNN、图像、大 batch 训练、离线训练稳定场景 |
+| LN | Transformer、NLP、变长序列、小 batch、在线推理场景 |
+
+**和你项目的关系**
+
+你现在用到的主生成模型和检索增强链路，本质上都是 Transformer 路线，所以背后的主流归一化是 **LayerNorm**，不是 BatchNorm。
+
+**八股原理总结**：
+
+| 问题 | BN | LN |
+|---|---|---|
+| 归一化维度 | batch 维 | 特征维 |
+| 是否依赖 batch size | 是 | 否 |
+| 推理和训练一致性 | 较弱 | 更强 |
+| 典型场景 | CNN / CV | Transformer / NLP |
+
+### 追问
+
+- 为什么 Transformer 普遍用 LN 不用 BN
+- 小 batch 时 BN 为什么会不稳定
+- RMSNorm 和 LN 的区别是什么
+
+### 问题 5
+
+BN 的离线 / 在线不一致问题怎么解决？
+
+### 回答
+
+这个问题本质上来自：
+
+- **训练时**：BN 用当前 mini-batch 的均值和方差
+- **推理时**：BN 用训练阶段累积的 running mean / running var
+
+如果训练分布和推理分布不一致，或者 batch 太小，BN 就可能出现“训练好好的，线上效果掉”的问题。
+
+常见解决方式有 5 类：
+
+1. **增大 batch size**
+   - 让训练统计更稳定
+   - 这是最直接但不一定最现实的方法
+
+2. **使用更稳的统计方式**
+   - 比如 SyncBN
+   - 在多卡训练时同步统计量
+
+3. **训练后重新校准 BN 统计量**
+   - 用一批接近线上分布的数据重新跑 forward
+   - 更新 running mean / var
+
+4. **冻结 BN**
+   - finetune 或小数据场景里，直接冻结 BN 参数和统计量
+
+5. **直接换归一化方案**
+   - 在小 batch、在线推理、序列建模里，很多时候直接换成 LN / GN 会更稳
+
+如果面试官追问“工程上你会怎么选”，一个很稳的回答是：
+
+> 如果是 CNN 大 batch 训练，我优先保留 BN，并通过足够 batch size、SyncBN 或统计量重校准解决一致性问题；如果是小 batch、在线推理、NLP/Transformer 场景，我通常会优先使用 LN，而不是去强行修 BN。
+
+**八股原理总结**：
+
+| 问题来源 | 解决思路 |
+|---|---|
+| 训练时用 batch 统计，推理时用 running 统计 | 重新校准、冻结或同步统计 |
+| batch 太小，统计不稳定 | 增大 batch、用 SyncBN、换 LN/GN |
+| 数据分布漂移 | 用更接近线上分布的数据做 BN calibration |
+
+### 追问
+
+- SyncBN 的原理是什么
+- 为什么小 batch 会让 BN 失效
+- 什么时候应该直接放弃 BN 改用 LN 或 GN
 
 ---
 
